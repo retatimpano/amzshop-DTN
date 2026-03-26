@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { isSameOrigin, requireAdminSession } from '@/lib/auth'
+import { normalizeAsin } from '@/lib/utils'
 
 export async function GET(request: NextRequest) {
   try {
@@ -7,6 +9,12 @@ export async function GET(request: NextRequest) {
     const categoryId = searchParams.get('categoryId')
     const featured = searchParams.get('featured')
     const limit = searchParams.get('limit')
+    const includeInactive = searchParams.get('includeInactive') === 'true'
+
+    if (includeInactive) {
+      const { response } = await requireAdminSession(request)
+      if (response) return response
+    }
     
     const where: any = {}
     
@@ -16,6 +24,9 @@ export async function GET(request: NextRequest) {
     
     if (featured === 'true') {
       where.featured = true
+    }
+    if (!includeInactive) {
+      where.active = true
     }
 
     const queryOptions: any = {
@@ -77,7 +88,11 @@ export async function GET(request: NextRequest) {
       reviewCount: (aggMap[p.id]?.reviewCount ?? 0),
     }))
 
-    return NextResponse.json(normalized)
+    const res = NextResponse.json(normalized)
+    if (!includeInactive) {
+      res.headers.set('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600')
+    }
+    return res
   } catch (error) {
     console.error('Error fetching products:', error)
     return NextResponse.json(
@@ -89,6 +104,12 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
+    if (!isSameOrigin(request)) {
+      return NextResponse.json({ error: '非法来源' }, { status: 403 })
+    }
+    const { response } = await requireAdminSession(request)
+    if (response) return response
+
     const body = await request.json()
     const {
       name,
@@ -112,6 +133,8 @@ export async function POST(request: NextRequest) {
       variantOptionLinks,
       youtubeUrl,
       youtubeIndex,
+      asin,
+      showAsinOnFrontend,
       // 新增字段：前台按钮显示控制
       showBuyOnAmazon,
       showAddToCart,
@@ -132,8 +155,8 @@ export async function POST(request: NextRequest) {
         return null
       } catch { return null }
     }
-    const asin = typeof amazonUrl === 'string' ? extractAsin(amazonUrl) : null
-    const normalizedAmazonUrl = asin ? `https://www.amazon.com/dp/${asin}` : amazonUrl
+    const amazonAsin = typeof amazonUrl === 'string' ? extractAsin(amazonUrl) : null
+    const normalizedAmazonUrl = amazonAsin ? `https://www.amazon.com/dp/${amazonAsin}` : amazonUrl
 
     // Validate required fields
     if (!name || !description || !price || !amazonUrl) {
@@ -169,11 +192,30 @@ export async function POST(request: NextRequest) {
       return Math.max(0, Math.min(raw, imageList.length))
     })()
 
-    // 生成唯一 slug
+    const normalizedAsin = normalizeAsin(asin)
+
+    if (normalizedAsin) {
+      const asinConflict = await db.product.findUnique({ where: { asin: normalizedAsin } })
+      if (asinConflict) {
+        return NextResponse.json(
+          { error: 'ASIN 已存在，请填写唯一值' },
+          { status: 400 }
+        )
+      }
+      const asinConflictBySlug = await db.product.findUnique({ where: { slug: normalizedAsin } })
+      if (asinConflictBySlug) {
+        return NextResponse.json(
+          { error: 'ASIN 与现有产品链接冲突，请更换 ASIN' },
+          { status: 400 }
+        )
+      }
+    }
+
+    // 生成唯一 slug（同时避免与 ASIN 冲突）
     const baseSlug = name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
     let slug = baseSlug
     let suffix = 1
-    while (await db.product.findUnique({ where: { slug } })) {
+    while (await db.product.findFirst({ where: { OR: [{ slug }, { asin: slug.toUpperCase() }] } })) {
       slug = `${baseSlug}-${suffix++}`
     }
 
@@ -243,6 +285,8 @@ export async function POST(request: NextRequest) {
     const createData: any = {
       title: name,
       slug,
+      asin: normalizedAsin,
+      showAsinOnFrontend: showAsinOnFrontend === true,
       mainImage: imageList[0],
       // 将长描述或简短描述存入 description 字段
       description: longDescription || description || '',
